@@ -33,8 +33,9 @@ The dataset is in `./data` ([`data/README.md`](data/README.md) gives the file fo
 
 - `raw`: the measured Raman maps (CSV). They are not stored in this repository. Link the data folder
   here, or set `SERS_DATA` to it.
-- `annotations`: `maps.csv`, the list of the 134 maps used, with split (`fit` 95, `test` 20,
-  `template` 18, `lettering` 1), label, applied µM and pixel seed
+- `annotations`: `maps.csv`, 134 annotation rows covering 122 unique map paths, with split
+  (`fit` 95, `test` 20, `template` 18, `lettering` 1), label, applied µM and pixel seed.
+  Twelve pure/background maps are used both for fitting and as gate templates.
 - `features`: `fit_table.npz`, the preprocessed pixel table of the 95 fitting maps
 
 The outputs of the scripts are in `./results` ([`results/README.md`](results/README.md)):
@@ -52,25 +53,77 @@ The outputs of the scripts are in `./results` ([`results/README.md`](results/REA
    conda activate sers-mixture-reader
    ```
 
-2. Fit both stages and compare them with the saved model. This uses `data/features/fit_table.npz`, so
-   the measured maps are not needed.
+2. Refit from the exact published feature table without the measured maps, and optionally compare
+   with the original saved model:
 
    ```bash
-   python train.py
+   python train.py --allow-legacy-cache --compare --output results/model/refit_portable.npz
    ```
 
-3. Read every mixture map held out and score the reads (needs the measured maps)
+   The opt-in uses checksum-verified historical features; it does **not** rebuild them with the
+   revised preprocessing. Annotation edits invalidate this fallback. With `SERS_DATA` available,
+   `python train.py --output results/model/refit_portable.npz` builds/verifies the current feature
+   cache and packages gate templates. New caches verify annotation, source checksums, code,
+   settings and package versions. Without raw maps, source files cannot be rechecked.
+
+   A model trained offline contains weights and its axis but no raw gate templates. Package those
+   once while the original template maps are available:
 
    ```bash
-   python evaluate.py
+   export SERS_DATA=/path/to/data
+   python bundle_model.py --model results/model/refit_portable.npz --output results/model/reader_bundle.npz
    ```
 
-4. Read maps with the saved model: the test maps and the written-ink map, or any map files given
+   To package the original published weights instead, omit `--model` in the bundling command.
+   Raw gate templates are not included in this repository and cannot be reconstructed from the
+   baseline-subtracted feature table. No replacement templates are fabricated.
+
+3. Read every mixture map held out and score the reads (needs the measured maps):
 
    ```bash
-   python predict.py
-   python predict.py path/to/map.csv
+   python evaluate.py --allow-legacy-cache --output-dir results/evaluate_runs/run01
    ```
+
+   Use a fresh output directory for each evaluation. To use a newly generated current cache,
+   omit `--allow-legacy-cache`. `--model` selects a model; fitting maps still use the documented
+   leave-group/condition-out refits, while test maps use the selected weights.
+
+4. Read a new map with the standalone bundle. This no longer requires `SERS_DATA` or the raw
+   training/template folder:
+
+   ```bash
+   python predict.py path/to/map.csv --model results/model/reader_bundle.npz --output-dir results/predict_runs/run01
+   ```
+
+   Without map arguments, the annotated test and lettering maps are selected (raw data needed).
+   Without `--output-dir`, predictions use a new unique directory under `results/predict_runs/`.
+   An explicit output directory must not already exist. Each input has a status/error row;
+   basename collisions are avoided. Partial failures return exit code 1 after saving the batch
+   summary and manifest. Historical `results/predict/` and `results/evaluate/` remain untouched.
+
+## Input and model validation
+
+CSV columns retain their positions: missing interior cells, non-finite values, malformed rows,
+empty maps and non-increasing axes are rejected with an error. Trailing empty CSV separators and
+fully blank rows are allowed. Axes must match the model/template within 1e-6 cm⁻¹; there is no
+automatic interpolation. Concentration reads require channels within 2137 ± 10 cm⁻¹.
+
+Portable NPZ models include the axis, ordered output names, linear weights, preprocessing settings,
+provenance and optional gate templates, and are loaded without pickle. The old `refit.npz` is a
+historical weights-only artifact, not a portable model: regenerate it with `train.py`. The bundled
+legacy `.dlm` is accepted only with its published checksum and recorded reference axis. Load only
+trusted legacy pickle files. Existing result tables are historical results, not new evaluations
+of the revised preprocessing.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The tests use synthetic maps for CSV/axis errors, cache invalidation, saturation filtering, model
+round-trips, template bundling, independent prediction, output collisions and partial failures.
+Full evaluation from measured maps still requires the external raw data.
 
 ## Citation
 

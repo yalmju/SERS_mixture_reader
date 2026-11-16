@@ -11,6 +11,11 @@ concentration. Writes to results/predict/:
 import csv
 import os
 import sys
+import argparse
+import hashlib
+import json
+import tempfile
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -23,52 +28,93 @@ COMP = config.ANALYTES
 
 def load_coords(path, n_wn):
     """x, y of the pixels `algorithm.load_map` keeps, in the same order."""
-    with open(path, newline="") as fh:
-        rows = list(csv.reader(fh))
-    xy = []
-    for row in rows[3:]:
-        cells = [v for v in row if str(v).strip() != ""]
-        if len(cells) >= n_wn + 2:
-            xy.append([float(cells[0]), float(cells[1])])
-    return np.asarray(xy, float)
+    wn, _cube, xy = A.load_map(path, return_coords=True)
+    if len(wn) != n_wn:
+        raise ValueError("Coordinate/spectral channel mismatch")
+    return xy
 
 
 def default_maps():
     return [p for p, _lab, _s in config.maps("test")] + [p for p, _lab, _s in config.maps("lettering")]
 
 
-def main(paths):
-    model = A.load_model(config.MODEL)
-    templates = A.class_templates(config.templates())
-    os.makedirs(OUT, exist_ok=True)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Read Raman maps with a portable or legacy PLS model")
+    parser.add_argument("paths", nargs="*")
+    parser.add_argument("--model", default=config.MODEL)
+    parser.add_argument("--output-dir")
+    args = parser.parse_args(argv)
+    paths = args.paths or default_maps()
+    if not paths:
+        parser.error("No input maps selected")
+    model = config.load_reader_model(args.model)
+    templates = model.get("templates")
+    if templates is None:
+        if config.raw_root() is None:
+            parser.error("Model has no gate templates. Set SERS_DATA and run bundle_model.py once, then use --model bundle.npz")
+        templates = A.class_templates(config.templates())
+    parent = os.path.join(config.RESULTS, "predict_runs")
+    if args.output_dir:
+        out = os.path.abspath(args.output_dir)
+        os.makedirs(out, exist_ok=False)
+    else:
+        os.makedirs(parent, exist_ok=True)
+        out = tempfile.mkdtemp(prefix=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ_"), dir=parent)
     outputs = list(model["outputs"])
-    summary = []
+    summary, inputs, failures = [], [], 0
+    seen = set()
     for path in paths:
         name = os.path.splitext(os.path.basename(path))[0]
-        wn, cube = A.load_map(path)
-        r = A.read_map(wn, cube, model, templates)
-        xy = load_coords(path, len(wn))
-        with open(os.path.join(OUT, f"{name}_pixels.csv"), "w", newline="", encoding="utf-8") as fh:
-            w = csv.writer(fh)
-            w.writerow(["x", "y", "gate"] + outputs)
-            for (x, y), g, s in zip(xy, r["gate"], r["pixel_shares"]):
-                w.writerow([f"{x:g}", f"{y:g}", int(g)] + [f"{v:.4f}" for v in s])
-        row = {"map": name, "gate_px": int(r["gate"].sum()), "n_px": len(r["gate"])}
-        for s in COMP:
-            row[f"{s}_pct"] = "" if r["composition"] is None else round(100 * float(r["composition"][s]), 2)
-        for s in COMP:
-            row[f"{s}_uM"] = "" if r["uM"] is None else round(float(r["uM"][s]), 3)
+        identity = os.path.normcase(os.path.abspath(path))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        file_id = name + "_" + hashlib.sha256(identity.encode()).hexdigest()[:12]
+        row = {"map": name, "input": os.path.abspath(path), "status": "failed", "error": "",
+               "pixel_file": "", "gate_px": "", "n_px": ""}
+        row.update({f"{s}_{unit}": "" for unit in ("pct", "uM") for s in COMP})
+        record = {"path": os.path.abspath(path)}
+        try:
+            record["sha256"] = config.file_hash(path)
+            wn, cube, xy = A.load_map(path, return_coords=True)
+            r = A.read_map(wn, cube, model, templates)
+            if not (len(xy) == len(r["gate"]) == len(r["pixel_shares"])):
+                raise ValueError("Coordinate, gate and prediction counts differ")
+            pixel_file = f"{file_id}_pixels.csv"
+            with open(os.path.join(out, pixel_file + ".tmp"), "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(["x", "y", "gate"] + outputs)
+                for (x, y), g, s in zip(xy, r["gate"], r["pixel_shares"]):
+                    w.writerow([f"{x:g}", f"{y:g}", int(g)] + [f"{v:.4f}" for v in s])
+            os.replace(os.path.join(out, pixel_file + ".tmp"), os.path.join(out, pixel_file))
+            row.update(status="completed" if r["composition"] is not None else "no_analyte",
+                       pixel_file=pixel_file, gate_px=int(r["gate"].sum()), n_px=len(r["gate"]))
+            for s in COMP:
+                row[f"{s}_pct"] = "" if r["composition"] is None else round(100 * float(r["composition"][s]), 2)
+                row[f"{s}_uM"] = "" if r["uM"] is None else round(float(r["uM"][s]), 3)
+        except (OSError, ValueError, RuntimeError) as exc:
+            failures += 1
+            row["error"] = str(exc)
+        inputs.append(record)
         summary.append(row)
-        comp = "no pixel passed the gate" if r["composition"] is None else \
-            "DQ : TBZ : THI = " + " : ".join(f"{row[f'{s}_pct']:.1f}" for s in COMP) + \
-            " %  ·  µM " + " / ".join(f"{row[f'{s}_uM']:.2f}" for s in COMP)
-        print(f"{name}  gate {row['gate_px']}/{row['n_px']}  {comp}", flush=True)
-    with open(os.path.join(OUT, "maps.csv"), "w", newline="", encoding="utf-8") as fh:
+        print(f"{name}: {row['status']} {row['error']}", flush=True)
+    with open(os.path.join(out, "maps.csv.tmp"), "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=list(summary[0]))
         w.writeheader()
         w.writerows(summary)
-    print("saved:", os.path.relpath(OUT, config.ROOT))
+    os.replace(os.path.join(out, "maps.csv.tmp"), os.path.join(out, "maps.csv"))
+    with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump({"model": os.path.abspath(args.model), "model_sha256": config.file_hash(args.model),
+                   "inputs": inputs, "settings": A.pipeline_settings(),
+                   "runtime": config.runtime_versions(), "algorithm_sha256": config.file_hash(A.__file__),
+                   "template_sha256": hashlib.sha256(np.asarray(templates["wn"]).tobytes()
+                       + np.asarray(list(templates["spectra"].values())).tobytes()
+                       + json.dumps(list(templates["spectra"])).encode()).hexdigest(),
+                   "model_provenance": model.get("provenance", {}),
+                   "failures": failures}, fh, indent=2)
+    print("saved:", os.path.abspath(out))
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:] or default_maps())
+    sys.exit(main())
