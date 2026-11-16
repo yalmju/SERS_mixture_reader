@@ -1,0 +1,2 @@
+composition, 64 conditions: 12.27 %p · fitting grid 12.58 (n=52) · test grid 10.90 (n=12) · outside the grid 23.24 (n=38)
+concentration, 64 conditions: within 2-fold 95.8 % (184/192) · within 1.5-fold 77.1 % · median 1.26× · all three within 2-fold 57/64
